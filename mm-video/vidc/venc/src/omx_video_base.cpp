@@ -76,6 +76,10 @@ ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define VC1_STRUCT_B_POS            24
 #define VC1_SEQ_LAYER_SIZE          36
 
+#define IS_NOT_ALIGNED( num, to) (num & (to-1))
+#define ALIGN( num, to ) (((num) + (to-1)) & (~(to-1)))
+#define SZ_2K (2048)
+
 typedef struct OMXComponentCapabilityFlagsType
 {
     ////////////////// OMX COMPONENT CAPABILITY RELATED MEMBERS
@@ -1954,7 +1958,8 @@ OMX_ERRORTYPE  omx_video::get_extension_index(OMX_IN OMX_HANDLETYPE      hComp,
   char *extns[] = {
     "OMX.QCOM.index.param.SliceDeliveryMode",
     "OMX.google.android.index.storeMetaDataInBuffers",
-    "OMX.google.android.index.prependSPSPPSToIDRFrames"
+    "OMX.google.android.index.prependSPSPPSToIDRFrames",
+    "OMX.google.android.index.setVUIStreamRestrictFlag"
   };
 
   if(m_state == OMX_StateInvalid)
@@ -1974,6 +1979,9 @@ OMX_ERRORTYPE  omx_video::get_extension_index(OMX_IN OMX_HANDLETYPE      hComp,
         return OMX_ErrorNone;
   } else if (!strncmp(paramName, extns[2], strlen(extns[2]))) {
         *indexType = (OMX_INDEXTYPE)OMX_QcomIndexParamSequenceHeaderWithIDR;
+        return OMX_ErrorNone;
+  } else if (!strncmp(paramName, extns[3], strlen(extns[3]))) {
+        *indexType = (OMX_INDEXTYPE)OMX_QcomIndexParamEnableVUIStreamRestrictFlag;
         return OMX_ErrorNone;
   }
 #endif
@@ -2125,7 +2133,7 @@ OMX_ERRORTYPE  omx_video::use_input_buffer(
 #ifdef USE_ION
       m_pInput_ion[i].ion_device_fd = alloc_map_ion_memory(m_sInPortDef.nBufferSize,
                                       &m_pInput_ion[i].ion_alloc_data,
-                                      &m_pInput_ion[i].fd_ion_data,CACHED);
+                                      &m_pInput_ion[i].fd_ion_data,ION_FLAG_CACHED);
       if(m_pInput_ion[i].ion_device_fd < 0) {
         DEBUG_PRINT_ERROR("\nERROR:ION device open() Failed");
         return OMX_ErrorInsufficientResources;
@@ -2324,7 +2332,7 @@ OMX_ERRORTYPE  omx_video::use_output_buffer(
         m_pOutput_ion[i].ion_device_fd = alloc_map_ion_memory(
                                          m_sOutPortDef.nBufferSize,
                                          &m_pOutput_ion[i].ion_alloc_data,
-                                         &m_pOutput_ion[i].fd_ion_data,CACHED);
+                                         &m_pOutput_ion[i].fd_ion_data,ION_FLAG_CACHED);
       if(m_pOutput_ion[i].ion_device_fd < 0) {
         DEBUG_PRINT_ERROR("\nERROR:ION device open() Failed");
         return OMX_ErrorInsufficientResources;
@@ -2501,8 +2509,10 @@ OMX_ERRORTYPE omx_video::free_input_buffer(OMX_BUFFERHEADERTYPE *bufferHdr)
     }
     if(!mUseProxyColorFormat)
       return OMX_ErrorNone;
-    else
+    else {
       c2d_conv.close();
+      opaque_buffer_hdr[index] = NULL;
+    }
   }
 #endif
   if(index < m_sInPortDef.nBufferCountActual && !mUseProxyColorFormat &&
@@ -2741,7 +2751,7 @@ OMX_ERRORTYPE  omx_video::allocate_input_buffer(
 #ifdef USE_ION
     m_pInput_ion[i].ion_device_fd = alloc_map_ion_memory(m_sInPortDef.nBufferSize,
                                     &m_pInput_ion[i].ion_alloc_data,
-                                    &m_pInput_ion[i].fd_ion_data,CACHED);
+                                    &m_pInput_ion[i].fd_ion_data,ION_FLAG_CACHED);
     if(m_pInput_ion[i].ion_device_fd < 0) {
       DEBUG_PRINT_ERROR("\nERROR:ION device open() Failed");
       return OMX_ErrorInsufficientResources;
@@ -2900,7 +2910,7 @@ OMX_ERRORTYPE  omx_video::allocate_output_buffer(
 #ifdef USE_ION
       m_pOutput_ion[i].ion_device_fd = alloc_map_ion_memory(m_sOutPortDef.nBufferSize,
                                        &m_pOutput_ion[i].ion_alloc_data,
-                                       &m_pOutput_ion[i].fd_ion_data,CACHED);
+                                       &m_pOutput_ion[i].fd_ion_data,ION_FLAG_CACHED);
       if(m_pOutput_ion[i].ion_device_fd < 0) {
         DEBUG_PRINT_ERROR("\nERROR:ION device open() Failed");
         return OMX_ErrorInsufficientResources;
@@ -3431,6 +3441,28 @@ OMX_ERRORTYPE  omx_video::empty_this_buffer_proxy(OMX_IN OMX_HANDLETYPE         
     memcpy (pmem_data_buf, (buffer->pBuffer + buffer->nOffset),
             buffer->nFilledLen);
     DEBUG_PRINT_LOW("memcpy() done in ETBProxy for i/p Heap UseBuf");
+  } else if (m_sInPortDef.format.video.eColorFormat ==
+      OMX_COLOR_FormatYUV420SemiPlanar && !mUseProxyColorFormat) {
+      //For the case where YUV420SP buffers are qeueued to component
+      //by sources other than camera (Apps via MediaCodec), alignment
+      //of chroma-plane to 2K is necessary.
+      //For RGB buffers, color-conversion takes care of such alignment
+      OMX_U32 width = m_sInPortDef.format.video.nFrameWidth;
+      OMX_U32 height = m_sInPortDef.format.video.nFrameHeight;
+      OMX_U32 chromaOffset = width * height;
+      if (IS_NOT_ALIGNED(chromaOffset, SZ_2K)) {
+          OMX_U32 chromaSize = (width * height)/2;
+          chromaOffset = ALIGN(chromaOffset,SZ_2K);
+          if (buffer->nAllocLen >= chromaOffset + chromaSize) {
+              OMX_U8* buf = buffer->pBuffer;
+              memmove(buf + chromaOffset, buf + (width*height), chromaSize);
+          } else {
+             DEBUG_PRINT_ERROR("Failed to align Chroma. from %u to %u : \
+                 Insufficient bufferLen=%u v/s Required=%u",
+                 (width*height), chromaOffset, buffer->nAllocLen,
+                 chromaOffset+chromaSize);
+          }
+      }
   }
 #ifdef _COPPER_
   if(dev_empty_buf(buffer, pmem_data_buf,nBufIndex,m_pInput_pmem[nBufIndex].fd) != true)
@@ -4275,11 +4307,7 @@ int omx_video::alloc_map_ion_memory(int size,struct ion_allocation_data *alloc_d
     DEBUG_PRINT_ERROR("\nInvalid input to alloc_map_ion_memory");
     return -EINVAL;
 	}
-        if(!secure_session && flag == CACHED) {
-             ion_dev_flags = O_RDONLY;
-	} else {
-             ion_dev_flags = O_RDONLY | O_DSYNC;
-        }
+    ion_dev_flags = O_RDONLY;
         ion_device_fd = open (MEM_DEVICE,ion_dev_flags);
         if(ion_device_fd < 0)
         {
@@ -4288,11 +4316,16 @@ int omx_video::alloc_map_ion_memory(int size,struct ion_allocation_data *alloc_d
         }
         alloc_data->len = size;
         alloc_data->align = 4096;
+        alloc_data->flags = 0;
+        if(!secure_session && (flag & ION_FLAG_CACHED))
+        {
+          alloc_data->flags = ION_FLAG_CACHED;
+        }
 
         if (secure_session)
-           alloc_data->flags = (ION_HEAP(MEM_HEAP_ID) | ION_SECURE);
+           alloc_data->heap_mask = (ION_HEAP(MEM_HEAP_ID) | ION_SECURE);
         else
-           alloc_data->flags = (ION_HEAP(MEM_HEAP_ID) |
+           alloc_data->heap_mask = (ION_HEAP(MEM_HEAP_ID) |
                 ION_HEAP(ION_IOMMU_HEAP_ID));
 
         rc = ioctl(ion_device_fd,ION_IOC_ALLOC,alloc_data);
@@ -4520,25 +4553,27 @@ OMX_ERRORTYPE  omx_video::empty_this_buffer_opaque(OMX_IN OMX_HANDLETYPE hComp,
   /*Enable following code once private handle color format is
     updated correctly*/
 
-  if(c2d_opened && handle->format != c2d_conv.get_src_format()) {
-    c2d_conv.close();
-    c2d_opened = false;
-  }
-  if (!c2d_opened) {
-      if (handle->format == HAL_PIXEL_FORMAT_RGBA_8888) {
-        DEBUG_PRINT_ERROR("\n open Color conv for RGBA888");
-        if(!c2d_conv.open(m_sInPortDef.format.video.nFrameHeight,
-             m_sInPortDef.format.video.nFrameWidth,RGBA8888,NV12_2K)){
-           m_pCallbacks.EmptyBufferDone(hComp,m_app_data,buffer);
-           DEBUG_PRINT_ERROR("\n Color conv open failed");
-           return OMX_ErrorBadParameter;
+  if(buffer->nFilledLen > 0) {
+    if(c2d_opened && handle->format != c2d_conv.get_src_format()) {
+      c2d_conv.close();
+      c2d_opened = false;
+    }
+    if (!c2d_opened) {
+        if (handle->format == HAL_PIXEL_FORMAT_RGBA_8888) {
+          DEBUG_PRINT_ERROR("\n open Color conv for RGBA888");
+          if(!c2d_conv.open(m_sInPortDef.format.video.nFrameHeight,
+               m_sInPortDef.format.video.nFrameWidth,RGBA8888,NV12_2K)){
+             m_pCallbacks.EmptyBufferDone(hComp,m_app_data,buffer);
+             DEBUG_PRINT_ERROR("\n Color conv open failed");
+             return OMX_ErrorBadParameter;
+          }
+          c2d_opened = true;
+        } else if(handle->format != HAL_PIXEL_FORMAT_NV12_ENCODEABLE) {
+          DEBUG_PRINT_ERROR("\n Incorrect color format");
+          m_pCallbacks.EmptyBufferDone(hComp,m_app_data,buffer);
+          return OMX_ErrorBadParameter;
         }
-        c2d_opened = true;
-      } else if(handle->format != HAL_PIXEL_FORMAT_NV12_ENCODEABLE) {
-        DEBUG_PRINT_ERROR("\n Incorrect color format");
-        m_pCallbacks.EmptyBufferDone(hComp,m_app_data,buffer);
-        return OMX_ErrorBadParameter;
-      }
+    }
   }
 
   if(input_flush_progress == true)
@@ -4575,10 +4610,12 @@ OMX_ERRORTYPE omx_video::queue_meta_buffer(OMX_HANDLETYPE hComp,
     return OMX_ErrorBadParameter;
   }
 
-  if(dev_use_buf(&Input_pmem_info,PORT_INDEX_IN,0) != true) {
-    DEBUG_PRINT_ERROR("\nERROR: in dev_use_buf");
-    post_event ((unsigned int)psource_frame,0,OMX_COMPONENT_GENERATE_EBD);
-    ret = OMX_ErrorBadParameter;
+  if(psource_frame->nFilledLen > 0) {
+   if(dev_use_buf(&Input_pmem_info,PORT_INDEX_IN,0) != true) {
+     DEBUG_PRINT_ERROR("\nERROR: in dev_use_buf");
+     post_event ((unsigned int)psource_frame,0,OMX_COMPONENT_GENERATE_EBD);
+     ret = OMX_ErrorBadParameter;
+   }
   }
 
   if(ret == OMX_ErrorNone)
@@ -4608,12 +4645,20 @@ OMX_ERRORTYPE omx_video::convert_queue_buffer(OMX_HANDLETYPE hComp,
   }
 
   if(!psource_frame->nFilledLen){
-    pdest_frame->nOffset = 0;
-    pdest_frame->nFilledLen = 0;
-    pdest_frame->nTimeStamp = psource_frame->nTimeStamp;
-    pdest_frame->nFlags = psource_frame->nFlags;
-    DEBUG_PRINT_LOW("\n Buffer header %p Filled len size %d",
-         pdest_frame,pdest_frame->nFilledLen);
+    if(psource_frame->nFlags & OMX_BUFFERFLAG_EOS){
+        pdest_frame->nFilledLen = psource_frame->nFilledLen;
+        pdest_frame->nTimeStamp = psource_frame->nTimeStamp;
+        pdest_frame->nFlags = psource_frame->nFlags;
+        DEBUG_PRINT_HIGH("\n Skipping color conversion for empty EOS \
+          Buffer header=%p filled-len=%d", pdest_frame,pdest_frame->nFilledLen);
+    } else {
+        pdest_frame->nOffset = 0;
+        pdest_frame->nFilledLen = 0;
+        pdest_frame->nTimeStamp = psource_frame->nTimeStamp;
+        pdest_frame->nFlags = psource_frame->nFlags;
+        DEBUG_PRINT_LOW("\n Buffer header %p Filled len size %d",
+           pdest_frame,pdest_frame->nFilledLen);
+    }
   } else {
      uva = (unsigned char *)mmap(NULL, Input_pmem_info.size,
                            PROT_READ|PROT_WRITE,
@@ -4707,6 +4752,8 @@ OMX_ERRORTYPE omx_video::push_input_buffer(OMX_HANDLETYPE hComp)
                         Input_pmem_info.offset,
                         Input_pmem_info.size);
       ret = queue_meta_buffer(hComp,Input_pmem_info);
+    } else if(psource_frame->nFlags & OMX_BUFFERFLAG_EOS & mUseProxyColorFormat) {
+       ret = convert_queue_buffer(hComp,Input_pmem_info,index);
     } else {
       private_handle_t *handle = (private_handle_t *)media_buffer->meta_handle;
       Input_pmem_info.buffer = media_buffer;
